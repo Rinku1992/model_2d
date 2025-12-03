@@ -1,0 +1,32 @@
+Environment files
+
+.env
+.venv
+venv/
+env/
+/bin
+/Scripts
+/Include
+/Lib
+
+Byte-compiled / optimized / DLL files
+
+pycache/
+*.py[cod]
+*$py.class
+
+IDE-specific files (VS Code, PyCharm, etc.)
+
+.vscode/
+.idea/
+
+Operating System files
+
+.DS_Store
+Thumbs.db
+
+Log and temporary files
+
+*.log
+/build/
+/dist/
