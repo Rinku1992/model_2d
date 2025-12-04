@@ -8,13 +8,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw
 
 Coord = Tuple[int, int]  # (row, col)
 
@@ -22,9 +21,7 @@ Coord = Tuple[int, int]  # (row, col)
 @dataclass
 class Segment:
     path: List[Coord]
-    orientation: str  # "horizontal" or "vertical"
-    angle_deg: float  # PCA angle relative to +x (0..90)
-    aligned: bool  # True when angle is axis-aligned within tolerance
+    orientation: str | None  # "horizontal", "vertical", or None
 
 
 NEIGHBORS_8: Tuple[Coord, ...] = (
@@ -35,16 +32,24 @@ NEIGHBORS_8: Tuple[Coord, ...] = (
 
 
 def load_binary_mask(path: str) -> np.ndarray:
-    img = Image.open(path).convert("L")
-    data = (np.array(img) > 0).astype(np.uint8)
-    return data
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Could not read input image: {path}")
+    # Normalize to {0,1}
+    _, binary = cv2.threshold(img, 0, 1, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    return binary.astype(np.uint8)
 
 
 def flag_if_not_single_pixel(mask: np.ndarray) -> bool:
-    block_sum = mask[:-1, :-1] + mask[1:, :-1] + mask[:-1, 1:] + mask[1:, 1:]
-    thick = np.any(block_sum == 4)
+    """
+    Return True if any 2x2 fully-foreground block exists (implies thickness > 1).
+    """
+    kernel = np.ones((2, 2), dtype=np.uint8)
+    counts = cv2.filter2D(mask, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+    thick = np.any(counts == 4)
     if thick:
-        coords = np.argwhere(block_sum == 4)
+        # find one example to report
+        coords = np.argwhere(counts == 4)
         sample = tuple(int(v) for v in coords[0]) if coords.size else None
         sys.stderr.write(
             f"[HITL] Detected wall thickness >1px near pixel (row, col)={sample}. "
@@ -88,7 +93,8 @@ def trace_segments(foreground: Set[Coord]) -> List[List[Coord]]:
             prev, current = node, nb
             while True:
                 path.append(current)
-                nbrs = [n for n in neighbors(current, foreground) if n != prev]
+                nbrs = neighbors(current, foreground)
+                nbrs = [n for n in nbrs if n != prev]
                 if degree.get(current, 0) != 2 or not nbrs:
                     break
                 next_pixel = nbrs[0]
@@ -106,7 +112,8 @@ def trace_segments(foreground: Set[Coord]) -> List[List[Coord]]:
             prev, current = start, nb
             while True:
                 path.append(current)
-                nbrs = [n for n in neighbors(current, foreground) if n != prev]
+                nbrs = neighbors(current, foreground)
+                nbrs = [n for n in nbrs if n != prev]
                 if not nbrs:
                     break
                 next_pixel = nbrs[0]
@@ -123,24 +130,20 @@ def trace_segments(foreground: Set[Coord]) -> List[List[Coord]]:
     return segments
 
 
-def pca_orientation(path: Sequence[Coord]) -> float:
-    """Return absolute angle in degrees relative to +x axis (0..90)."""
-    coords = np.array([(p[1], p[0]) for p in path], dtype=float)  # (x, y)
-    if len(coords) == 1:
-        return 0.0
-    coords -= coords.mean(axis=0)
-    cov = np.cov(coords.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    principal = eigvecs[:, np.argmax(eigvals)]
-    angle = math.degrees(math.atan2(abs(principal[1]), abs(principal[0])))
-    return angle
-
-
-def classify_segment(path: Sequence[Coord]) -> Tuple[str, float, bool]:
-    angle = pca_orientation(path)
-    orientation = "horizontal" if angle <= 45 else "vertical"
-    aligned = (angle <= 15) if orientation == "horizontal" else (angle >= 75)
-    return orientation, angle, aligned
+def classify_segment(path: Sequence[Coord]) -> str | None:
+    if len(path) < 2:
+        return None
+    ys = [p[0] for p in path]
+    xs = [p[1] for p in path]
+    dy = max(ys) - min(ys)
+    dx = max(xs) - min(xs)
+    if dx == dy == 0:
+        return None
+    if dx >= dy * 1.2:
+        return "horizontal"
+    if dy >= dx * 1.2:
+        return "vertical"
+    return None
 
 
 def extract_segments(mask: np.ndarray) -> List[Segment]:
@@ -148,8 +151,8 @@ def extract_segments(mask: np.ndarray) -> List[Segment]:
     raw_paths = trace_segments(foreground)
     segments: List[Segment] = []
     for path in raw_paths:
-        orient, angle, aligned = classify_segment(path)
-        segments.append(Segment(path=list(path), orientation=orient, angle_deg=angle, aligned=aligned))
+        orient = classify_segment(path)
+        segments.append(Segment(path=list(path), orientation=orient))
     return segments
 
 
@@ -157,24 +160,39 @@ def canonical_line_value(values: Iterable[int]) -> int:
     arr = np.fromiter(values, dtype=int)
     if arr.size == 0:
         return 0
-    return int(round(float(np.median(arr))))
+    return int(np.median(arr))
 
 
-def merge_axis_aligned(segments: List[Segment]) -> List[Tuple[int, int, int, int]]:
-    horizontals: List[Dict[str, int]] = []  # y, x_min, x_max
-    verticals: List[Dict[str, int]] = []  # x, y_min, y_max
+def merge_axis_aligned(segments: List[Segment]) -> Tuple[List[Tuple[int, int, int, int]], List[Segment]]:
+    """
+    Merge horizontal/vertical segments separately.
+
+    Returns
+    -------
+    merged_lines : list of (x1, y1, x2, y2) tuples
+    untouched    : list of segments that were not classified
+    """
+    horizontals: List[Dict] = []  # type: ignore[var-annotated]
+    verticals: List[Dict] = []  # type: ignore[var-annotated]
+    unknown: List[Segment] = []
 
     for seg in segments:
         ys = [p[0] for p in seg.path]
         xs = [p[1] for p in seg.path]
-        if seg.orientation == "horizontal" and seg.aligned:
-            horizontals.append(
-                {"y": canonical_line_value(ys), "x_min": min(xs), "x_max": max(xs)}
-            )
-        elif seg.orientation == "vertical" and seg.aligned:
-            verticals.append(
-                {"x": canonical_line_value(xs), "y_min": min(ys), "y_max": max(ys)}
-            )
+        if seg.orientation == "horizontal":
+            horizontals.append({
+                "y": canonical_line_value(ys),
+                "x_min": min(xs),
+                "x_max": max(xs),
+            })
+        elif seg.orientation == "vertical":
+            verticals.append({
+                "x": canonical_line_value(xs),
+                "y_min": min(ys),
+                "y_max": max(ys),
+            })
+        else:
+            unknown.append(seg)
 
     merged: List[Tuple[int, int, int, int]] = []
 
@@ -232,81 +250,65 @@ def merge_axis_aligned(segments: List[Segment]) -> List[Tuple[int, int, int, int
                 current = nxt.copy()
         merged.append((band_x, current["y_min"], band_x, current["y_max"]))
 
-    return merged
+    return merged, unknown
 
 
 def draw_lines(shape: Tuple[int, int], lines: List[Tuple[int, int, int, int]]) -> np.ndarray:
-    canvas = Image.new("1", (shape[1], shape[0]), 0)
-    draw = ImageDraw.Draw(canvas)
+    canvas = np.zeros(shape, dtype=np.uint8)
     for x1, y1, x2, y2 in lines:
-        draw.line((x1, y1, x2, y2), fill=1, width=1)
-    return np.array(canvas, dtype=np.uint8)
+        cv2.line(canvas, (x1, y1), (x2, y2), color=1, thickness=1)
+    return canvas
 
 
 def fill_orthogonal_gaps(mask: np.ndarray) -> np.ndarray:
-    up = np.pad(mask[:-1, :], ((1, 0), (0, 0)))
-    down = np.pad(mask[1:, :], ((0, 1), (0, 0)))
-    left = np.pad(mask[:, :-1], ((0, 0), (1, 0)))
-    right = np.pad(mask[:, 1:], ((0, 0), (0, 1)))
+    """Fill 1-pixel gaps at T/corner junctions."""
+    up = np.pad(mask[:-1, :], ((1, 0), (0, 0)), mode="constant")
+    down = np.pad(mask[1:, :], ((0, 1), (0, 0)), mode="constant")
+    left = np.pad(mask[:, :-1], ((0, 0), (1, 0)), mode="constant")
+    right = np.pad(mask[:, 1:], ((0, 0), (0, 1)), mode="constant")
 
     empty = mask == 0
-    straight_bridge = ((left & right) | (up & down)) & empty
-    corner_fill = (up & left) | (up & right) | (down & left) | (down & right)
-    tjunction_fill = (left & right & (up | down)) | (up & down & (left | right))
-    fill_mask = (corner_fill | tjunction_fill | straight_bridge) & empty
+    corner_fill = (
+        (up & left) | (up & right) | (down & left) | (down & right)
+    )
+    tjunction_fill = (
+        (left & right & (up | down)) | (up & down & (left | right))
+    )
+    fill_mask = (corner_fill | tjunction_fill) & empty
     result = mask.copy()
     result[fill_mask] = 1
     return result
 
 
-def region_stats(segments: List[Segment], shape: Tuple[int, int]) -> None:
-    rows, cols = shape
-    row_split = [0, rows // 2, rows]
-    col_split = [0, cols // 3, (2 * cols) // 3, cols]
-    region_id = 1
-    for r_idx in range(2):
-        for c_idx in range(3):
-            r0, r1 = row_split[r_idx], row_split[r_idx + 1]
-            c0, c1 = col_split[c_idx], col_split[c_idx + 1]
-            segs = [
-                seg
-                for seg in segments
-                if any(r0 <= p[0] < r1 and c0 <= p[1] < c1 for p in seg.path)
-            ]
-            total = len(segs)
-            h = sum(1 for s in segs if s.orientation == "horizontal")
-            v = sum(1 for s in segs if s.orientation == "vertical")
-            print(
-                f"[INFO] Region {region_id}: Classified {h+v}/{total} "
-                f"(horizontal={h}, vertical={v})"
-            )
-            region_id += 1
-
-
 def stitch(input_path: str, output_path: str) -> None:
     binary = load_binary_mask(input_path)
     hitl = flag_if_not_single_pixel(binary)
-
     segments = extract_segments(binary)
-    print(f"[INFO] Total segments traced: {len(segments)}")
-    region_stats(segments, binary.shape)
 
-    merged_lines = merge_axis_aligned(segments)
+    classified = sum(1 for s in segments if s.orientation in {"horizontal", "vertical"})
+    unclassified = [s for s in segments if s.orientation is None]
+    if classified != len(segments):
+        sys.stderr.write(
+            f"[INFO] Segments classified: {classified}/{len(segments)}. "
+            f"Unclassified: {len(unclassified)}.\n"
+        )
+        if unclassified:
+            sys.stderr.write(
+                "[INFO] Unclassified segments retained without modification.\n"
+            )
+
+    merged_lines, leftover = merge_axis_aligned(segments)
 
     stitched = draw_lines(binary.shape, merged_lines)
 
-    # Preserve original geometry to avoid any dropped pixels and keep
-    # non-axis-aligned fragments untouched.
-    stitched = np.maximum(stitched, binary)
+    # Preserve any unclassified pixels from the original skeleton
+    for seg in leftover:
+        for r, c in seg.path:
+            stitched[r, c] = 1
 
     stitched = fill_orthogonal_gaps(stitched)
 
-    final_segments = extract_segments(stitched)
-    print(f"[INFO] Final classified: {len(final_segments)}/{len(final_segments)}")
-
-    Image.fromarray(stitched * 255).save(output_path)
-    recovered = int(stitched.sum() - binary.sum())
-    print(f"[INFO] Missing segments recovered: {recovered}")
+    cv2.imwrite(output_path, (stitched * 255).astype(np.uint8))
 
     if hitl:
         sys.stderr.write("[HITL] Manual review recommended before using stitched output.\n")
